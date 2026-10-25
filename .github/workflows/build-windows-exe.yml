@@ -1,0 +1,179 @@
+name: build-windows-exe
+
+# Builds the ONE-FILE Windows distribution:
+#   dist/GBVMonitor.exe — self-extracting exe that already contains the app,
+#   the llama.cpp engine, the GGUF chat + embedding models and Chromium.
+#   End users double-click it; no Python, no LM Studio, no installer.
+#
+# GitHub caps artifacts/release assets at ~2 GiB per file, so the exe is split
+# into <=1.5 GiB parts. Recombine on Windows (CMD):
+#     copy /b GBVMonitor.exe.001+GBVMonitor.exe.002+... GBVMonitor.exe
+# then verify with `certutil -hashfile GBVMonitor.exe SHA256` against the
+# GBVMonitor.exe.sha256 asset.
+
+on:
+  workflow_dispatch:
+    inputs:
+      chat_prefix:
+        description: "GGUF prefix to bundle (Qwen/Qwen2.5-7B-Instruct-GGUF). Example alternatives: qwen2.5-3b-instruct-q4_k_m"
+        required: false
+        default: "qwen2.5-7b-instruct-q4_k_m"
+      backends:
+        description: "llama.cpp engines to ship (cpu is always included)"
+        required: false
+        default: "cpu,vulkan"
+      publish_release:
+        description: "Also create a DRAFT GitHub release with the single-exe parts"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
+      CHAT_PREFIX: ${{ inputs.chat_prefix || 'qwen2.5-7b-instruct-q4_k_m' }}
+      BACKENDS: ${{ inputs.backends || 'cpu,vulkan' }}
+      PUBLISH_RELEASE: ${{ inputs.publish_release == true && '1' || '' }}
+      # Windows runners default to cp1252; make every Python process UTF-8 safe
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r packaging/requirements-build.txt
+
+      - name: Fetch engine + models
+        run: >
+          python packaging/fetch_assets.py --dest . --backends "$env:BACKENDS"
+          --chat-repo Qwen/Qwen2.5-7B-Instruct-GGUF --chat-prefix "$env:CHAT_PREFIX"
+          --embed-repo nomic-ai/nomic-embed-text-v1.5-GGUF
+          --embed-file nomic-embed-text-v1.5.Q8_0.gguf
+
+      - name: Install bundled Chromium
+        run: |
+          echo "PLAYWRIGHT_BROWSERS_PATH=$PWD/bundle-browsers" >> $env:GITHUB_ENV
+          python -m playwright install chromium
+
+      - name: PyInstaller (onedir app)
+        run: python -m PyInstaller packaging/gbv_monitor.spec --noconfirm
+
+      - name: Assemble dist folder
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (!(Test-Path "dist/GBVMonitor/GBVMonitor.exe")) { throw "GBVMonitor.exe missing — check PyInstaller step" }
+          robocopy runtime dist/GBVMonitor/runtime /E /NFL /NDL /NJH /NJS /NP | Out-Null
+          if ($LASTEXITCODE -ge 8) { throw "robocopy runtime failed ($LASTEXITCODE)" }
+          robocopy models dist/GBVMonitor/models /E /NFL /NDL /NJH /NJS /NP | Out-Null
+          if ($LASTEXITCODE -ge 8) { throw "robocopy models failed ($LASTEXITCODE)" }
+          robocopy bundle-browsers dist/GBVMonitor/ms-playwright /E /NFL /NDL /NJH /NJS /NP | Out-Null
+          if ($LASTEXITCODE -ge 8) { throw "robocopy browsers failed ($LASTEXITCODE)" }
+          Copy-Item packaging/DIST_README.txt dist/GBVMonitor/README.txt -Force
+          New-Item -ItemType Directory -Force -Path dist/GBVMonitor/output | Out-Null
+          New-Item -ItemType Directory -Force -Path dist/parts | Out-Null
+
+      - name: Build the single-file exe
+        run: |
+          python packaging/make_single_exe.py --dist dist/GBVMonitor --out dist/GBVMonitor.exe
+          & "dist/GBVMonitor.exe" --payload-info
+
+      - name: Split the single exe into uploadable parts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (!(Test-Path "dist/GBVMonitor.exe")) { throw "single-file exe was not produced" }
+
+          function Split-File {
+            param([string]$File, [long]$ChunkSize = 1500MB)
+            $size = (Get-Item $File).Length
+            if ($size -le $ChunkSize) { return }
+            Write-Host ("[split] {0} ({1:N2} GB)" -f $File, ($size / 1GB))
+            $fs = [IO.File]::OpenRead($File)
+            $buf = New-Object byte[] (64MB)
+            $n = 0
+            try {
+              while ($fs.Position -lt $size) {
+                $n++
+                $out = "$File.$('{0:d3}' -f $n)"
+                $outFs = [IO.File]::Create($out)
+                try {
+                  $remaining = $ChunkSize
+                  while ($remaining -gt 0) {
+                    $want = [int][Math]::Min([int64]$buf.Length, $remaining)
+                    $read = $fs.Read($buf, 0, $want)
+                    if ($read -le 0) { break }
+                    $outFs.Write($buf, 0, $read)
+                    $remaining -= $read
+                  }
+                } finally { $outFs.Close() }
+              }
+            } finally { $fs.Close() }
+            Remove-Item $File -Force
+          }
+
+          # keep the checksum next to the parts so users can verify the recombined exe
+          Copy-Item dist/GBVMonitor.exe.sha256 dist/parts/GBVMonitor.exe.sha256 -Force
+          Move-Item dist/GBVMonitor.exe dist/parts/GBVMonitor.exe -Force
+          Split-File -File dist/parts/GBVMonitor.exe
+          Get-ChildItem dist/parts | ForEach-Object { Write-Host ("[parts] {0}  {1:N0} MB" -f $_.Name, ($_.Length / 1MB)) }
+
+      - name: Upload artifacts (single exe parts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: GBVMonitor-single-exe
+          path: dist/parts/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Draft release with the single exe
+        if: env.PUBLISH_RELEASE == '1'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: portable-single-exe-${{ github.run_number }}
+          name: Portable GBV Monitor (single exe, run ${{ github.run_number }})
+          body: |
+            Download **all** `GBVMonitor.exe.00N` parts plus `GBVMonitor.exe.sha256`, then on Windows:
+
+            ```
+            copy /b GBVMonitor.exe.001+GBVMonitor.exe.002+GBVMonitor.exe.003+GBVMonitor.exe.004 GBVMonitor.exe
+            certutil -hashfile GBVMonitor.exe SHA256
+            ```
+
+            Double-click `GBVMonitor.exe`. First start unpacks the toolkit once into
+            `%LOCALAPPDATA%\GBVMonitor` (a few minutes), then the browser opens.
+            No Python, no LM Studio, no install, no admin rights.
+          draft: true
+          fail_on_unmatched_files: true
+          files: dist/parts/*
+
+      - name: Job summary
+        if: always()
+        shell: pwsh
+        run: |
+          @"
+          ## Single-file GBV Monitor
+
+          1. Download **GBVMonitor-single-exe** (all parts) or the draft release.
+          2. Recombine in CMD (adjust the part count):
+             ``copy /b GBVMonitor.exe.001+GBVMonitor.exe.002+… GBVMonitor.exe``
+          3. Check the hash: ``certutil -hashfile GBVMonitor.exe SHA256`` vs ``GBVMonitor.exe.sha256``.
+          4. Double-click **GBVMonitor.exe** → first start unpacks to %LOCALAPPDATA%\GBVMonitor → browser opens.
+
+          Scheduler mode: ``GBVMonitor.exe monitor run-due --enrich --verify``
+          "@ | Set-Content $env:GITHUB_STEP_SUMMARY

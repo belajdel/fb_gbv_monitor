@@ -1,0 +1,40 @@
+# ---- build artefacts / large runtime assets (never commit) ----
+models/
+runtime/
+bundle-browsers/
+dist/
+build/
+build-dist/
+build-inner/
+*.gguf
+*.gguf.sha256
+*.spec.bak
+.venv/
+.venv-build/
+venv/
+
+# ---- runtime data (case dataset, reports, screenshots, logs) ----
+output/
+logs/
+*.db
+*.db-journal
+*.db-wal
+*.sqlite
+
+# ---- python / editor noise ----
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.log
+env/
+.env
+.env.*
+
+# ---- OS junk & stray download-metadata streams ----
+Thumbs.db
+desktop.ini
+.DS_Store
+*?Zone.Identifier
+*.partial
